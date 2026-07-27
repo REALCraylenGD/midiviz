@@ -604,7 +604,7 @@ static struct {
     double pause_total_ms;
     LARGE_INTEGER pause_qpc;
     int fps, fps_frames;
-    double fps_last_time;
+    DWORD fps_last_tc;
 } g;
 
 static void all_off() {
@@ -724,10 +724,11 @@ static void render() {
     int ds = g.md->dur_ms / 1000;
     int ms_disp = (int)g.current_ms % 1000;
     g.fps_frames++;
-    if (g.current_ms - g.fps_last_time >= 1000.0) {
+    DWORD tc = GetTickCount();
+    if (tc - g.fps_last_tc >= 1000) {
         g.fps = g.fps_frames;
         g.fps_frames = 0;
-        g.fps_last_time = g.current_ms;
+        g.fps_last_tc = tc;
     }
     snprintf(buf, sizeof(buf), "%02d:%02d.%03d / %02d:%02d  %s  %d FPS  Notes: %d/%d  %s",
         sec / 60, sec % 60, ms_disp, ds / 60, ds % 60,
@@ -775,8 +776,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                 if (n->end_ms > 0 && n->end_ms <= g.current_ms) {
                     NOTE_SET_DONE(n);
                     g.active_cnt[NOTE_KEY(n)]--;
-                    if (g.active_cnt[NOTE_KEY(n)] == 0)
-                        synth_note_off(NOTE_KEY(n), NOTE_CHAN(n));
+                    synth_note_off(NOTE_KEY(n), NOTE_CHAN(n));
                 }
             }
             if (g.current_ms > g.md->dur_ms) { g.playing = 0; all_off(); memset(g.active_cnt, 0, sizeof(g.active_cnt)); }
@@ -956,7 +956,7 @@ static void s_advance_to_ms(double target_ms) {
     }
 }
 
-static struct { HWND hwnd; int win_w, win_h; HDC back_dc; HBITMAP back_bmp; int active_cnt[128]; int fps, fps_frames; double fps_last_time; } s_gui;
+static struct { HWND hwnd; int win_w, win_h; HDC back_dc; HBITMAP back_bmp; int active_cnt[128]; int fps, fps_frames; DWORD fps_last_tc; } s_gui;
 static int s_color_by_track;
 
 static void s_render() {
@@ -997,7 +997,8 @@ static void s_render() {
     SetBkMode(bdc, TRANSPARENT); SetTextColor(bdc, RGB(200,200,200));
     char buf[256]; int sec = (int)(s_current_ms/1000); int ds = s_dur_ms/1000;
     s_gui.fps_frames++;
-    if (s_current_ms - s_gui.fps_last_time >= 1000.0) { s_gui.fps = s_gui.fps_frames; s_gui.fps_frames = 0; s_gui.fps_last_time = s_current_ms; }
+    DWORD tc = GetTickCount();
+    if (tc - s_gui.fps_last_tc >= 1000) { s_gui.fps = s_gui.fps_frames; s_gui.fps_frames = 0; s_gui.fps_last_tc = tc; }
     snprintf(buf,sizeof(buf),"%02d:%02d.%03d / %02d:%02d  %s  %d FPS  Notes:%d", sec/60, sec%60, (int)s_current_ms%1000, ds/60, ds%60, s_playing?"PLAY":"PAUSED", s_gui.fps, s_vis_count);
     TextOutA(bdc, 10, 4, buf, strlen(buf));
     HPEN hp = CreatePen(PS_SOLID,2,RGB(60,200,255)); SelectObject(bdc, hp);

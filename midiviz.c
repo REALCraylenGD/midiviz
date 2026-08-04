@@ -23,6 +23,9 @@ static void __attribute__((noinline)) pad3(int x) { g_pad = x; }
 #define REL_LEN (SYNTH_SR / 1000 * 80)
 #define SUS_VAL 20000
 #define ENV_MAX 32767
+#define ATK_INV_FP (int)(((long long)ENV_MAX << 16) / ATK_LEN)
+#define DEC_INV_FP (int)(((long long)(ENV_MAX - SUS_VAL) << 16) / DEC_LEN)
+#define REL_INV_FP (int)(((long long)SUS_VAL << 16) / REL_LEN)
 
 #define WT_BITS 12
 #define WT_LEN (1 << WT_BITS)
@@ -61,18 +64,21 @@ static struct {
 } g_syn;
 
 static LARGE_INTEGER g_qpc_freq;
+static unsigned g_pitch_table[128];
+static int g_free_stack[SYNTH_NV], g_free_top;
 
 // Called from audio thread only
 static void voice_on(int key, int vel) {
-    int vi = -1; DWORD oldest = (DWORD)-1;
-    for (int i = 0; i < SYNTH_NV; i++) {
-        if (!g_syn.v[i].active) { vi = i; break; }
-        if (g_syn.v[i].stime < oldest) { oldest = g_syn.v[i].stime; vi = i; }
+    int vi;
+    if (g_free_top > 0) vi = g_free_stack[--g_free_top];
+    else {
+        DWORD oldest = (DWORD)-1; vi = 0;
+        for (int i = 0; i < SYNTH_NV; i++)
+            if (g_syn.v[i].stime < oldest) { oldest = g_syn.v[i].stime; vi = i; }
     }
-    if (vi < 0) return;
     SynthVoice *v = &g_syn.v[vi];
     v->active = 1; v->note = key; v->vel = vel > 0 ? vel : 80; v->phase = 0;
-    v->step = (unsigned)((440.0 * pow(2.0, (key - 69.0) / 12.0)) * (1LL << 32) / SYNTH_SR);
+    v->step = g_pitch_table[key & 127];
     v->ep = 0; v->epos = 0; v->stime = GetTickCount();
 }
 
@@ -92,21 +98,24 @@ static void fill_buf(short *buf) {
         int ep = v->ep, epos = v->epos;
         unsigned ph = v->phase, step = v->step;
         int vel = v->vel, active = 1;
+        long long vs = ((long long)vel << 16) / 127;
         for (int s = 0; s < SYNTH_BLEN; s++) {
             epos++;
             if (ep == 0 && epos >= ATK_LEN) { ep = 1; epos = 0; }
             else if (ep == 1 && epos >= DEC_LEN) { ep = 2; epos = 0; }
             else if (ep == 3 && epos >= REL_LEN) { active = 0; break; }
-            int env = ep == 0 ? ENV_MAX * epos / ATK_LEN :
-                      ep == 1 ? ENV_MAX - (ENV_MAX - SUS_VAL) * epos / DEC_LEN :
-                      ep == 2 ? SUS_VAL :
-                      ep == 3 ? SUS_VAL * (REL_LEN - epos) / REL_LEN : 0;
-            int mix = g_syn.wt[ph >> (32 - WT_BITS)] * env / ENV_MAX * vel / 127 >> 3;
+            int env;
+            if (ep == 0) env = (int)(((long long)epos * ATK_INV_FP) >> 16);
+            else if (ep == 1) env = ENV_MAX - (int)(((long long)epos * DEC_INV_FP) >> 16);
+            else if (ep == 2) env = SUS_VAL;
+            else env = (int)(((long long)(REL_LEN - epos) * REL_INV_FP) >> 16);
+            int sample = g_syn.wt[ph >> (32 - WT_BITS)];
+            int mix = (int)(((long long)sample * env * vs) >> 34);
             buf[s*2] += mix; buf[s*2+1] += mix;
             ph += step;
         }
         v->ep = ep; v->epos = epos; v->phase = ph;
-        if (!active) v->active = 0;
+        if (!active) { v->active = 0; if (g_free_top < SYNTH_NV) g_free_stack[g_free_top++] = vi; }
     }
 }
 
@@ -173,6 +182,9 @@ static void synth_init() {
     if (g_use_kdmapi) return;
     for (int i = 0; i < WT_LEN; i++)
         g_syn.wt[i] = (short)(sin(6.283185307 * i / WT_LEN) * 32767);
+    for (int i = 0; i < 128; i++)
+        g_pitch_table[i] = (unsigned)(440.0 * pow(2.0, (i - 69.0) / 12.0) * 4294967296.0 / SYNTH_SR);
+    g_free_top = 0;
     WAVEFORMATEX wf = {WAVE_FORMAT_PCM, 2, SYNTH_SR, SYNTH_SR * 4, 4, 16, 0};
     g_syn.wake = CreateEventA(0, 0, 0, 0);
     if (waveOutOpen(&g_syn.hwo, WAVE_MAPPER, &wf, (DWORD_PTR)syn_cb, (DWORD_PTR)&g_syn, CALLBACK_FUNCTION) != MMSYSERR_NOERROR)
@@ -576,6 +588,10 @@ static MidiData *parse_midi(const uint8_t *data, int64_t size) {
 
 static COLORREF chan_colors[16], track_colors[16];
 static int color_by_track;
+static HBRUSH chan_br[16], track_br[16];
+static HBRUSH g_br_key_active, g_br_key_inactive, g_br_black;
+static HPEN g_pen_grid, g_pen_hit;
+static HFONT g_font;
 static void init_colors() {
     int cols[16][3] = {
         {255,60,60},{255,180,60},{220,255,60},{60,255,100},
@@ -586,7 +602,15 @@ static void init_colors() {
     for (int i = 0; i < 16; i++) {
         chan_colors[i] = RGB(cols[i][0], cols[i][1], cols[i][2]);
         track_colors[i] = RGB(cols[(i*7+3)%16][0], cols[(i*7+3)%16][1], cols[(i*7+3)%16][2]);
+        chan_br[i] = CreateSolidBrush(chan_colors[i]);
+        track_br[i] = CreateSolidBrush(track_colors[i]);
     }
+    g_br_key_active = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    g_br_key_inactive = CreateSolidBrush(RGB(240, 240, 240));
+    g_br_black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    g_pen_grid = CreatePen(PS_SOLID, 1, RGB(30, 30, 30));
+    g_pen_hit = CreatePen(PS_SOLID, 2, RGB(60, 200, 255));
+    g_font = CreateFontA(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Consolas");
 }
 
 static struct {
@@ -632,25 +656,19 @@ static void draw_keyboard(HDC dc) {
     int kw = key_width();
     int ky = g.win_h - 30;
     int kh = 28;
-    
-    // White keys first
     for (int k = MIN_KEY; k <= MAX_KEY; k++) {
         if (is_black(k)) continue;
         int x = key_to_x(k);
         RECT r = {x, ky, x + kw, ky + kh};
-        HBRUSH br = g.active_cnt[k] ? GetStockObject(WHITE_BRUSH) : CreateSolidBrush(RGB(240, 240, 240));
-        FillRect(dc, &r, br);
-        if (!g.active_cnt[k]) DeleteObject(br);
-        FrameRect(dc, &r, GetStockObject(BLACK_BRUSH));
+        FillRect(dc, &r, g.active_cnt[k] ? g_br_key_active : g_br_key_inactive);
+        FrameRect(dc, &r, g_br_black);
     }
-    // Black keys
     for (int k = MIN_KEY; k <= MAX_KEY; k++) {
         if (!is_black(k)) continue;
         int x = key_to_x(k);
         RECT r = {x - kw / 4 + 1, ky, x + kw / 4 + 1, ky + kh / 2};
-        HBRUSH br = g.active_cnt[k] ? GetStockObject(WHITE_BRUSH) : GetStockObject(BLACK_BRUSH);
-        FillRect(dc, &r, br);
-        FrameRect(dc, &r, GetStockObject(BLACK_BRUSH));
+        FillRect(dc, &r, g.active_cnt[k] ? g_br_key_active : g_br_black);
+        FrameRect(dc, &r, g_br_black);
     }
 }
 
@@ -674,18 +692,16 @@ static void render() {
     
     HDC bdc = g.back_dc;
     RECT br = {0, 0, g.win_w, g.win_h};
-    FillRect(bdc, &br, GetStockObject(BLACK_BRUSH));
+    FillRect(bdc, &br, g_br_black);
     
     int hit_y = g.win_h - 35;
     
-    HPEN grid_pen = CreatePen(PS_SOLID, 1, RGB(30, 30, 30));
-    SelectObject(bdc, grid_pen);
+    SelectObject(bdc, g_pen_grid);
     for (int k = MIN_KEY; k <= MAX_KEY; k++) {
         int x = key_to_x(k);
         if (is_black(k)) continue;
         MoveToEx(bdc, x, 0, 0); LineTo(bdc, x, hit_y);
     }
-    DeleteObject(grid_pen);
     
     int max_future = (int)(g.current_ms + 1200);
     int min_past = (int)(g.current_ms - 500);
@@ -710,13 +726,12 @@ static void render() {
         
         int x = key_to_x(NOTE_KEY(n));
         RECT r = {x + 1, y_top, x + kw - 1, y_bot};
-        HBRUSH br = CreateSolidBrush(color_by_track ? track_colors[NOTE_TRACK(n) & 15] : chan_colors[NOTE_CHAN(n) & 15]);
-        FillRect(bdc, &r, br);
-        DeleteObject(br);
+        FillRect(bdc, &r, color_by_track ? track_br[NOTE_TRACK(n) & 15] : chan_br[NOTE_CHAN(n) & 15]);
     }
     
     draw_keyboard(bdc);
     
+    SelectObject(bdc, g_font);
     SetBkMode(bdc, TRANSPARENT);
     SetTextColor(bdc, RGB(200, 200, 200));
     char buf[256];
@@ -730,17 +745,15 @@ static void render() {
         g.fps_frames = 0;
         g.fps_last_tc = tc;
     }
-    snprintf(buf, sizeof(buf), "%02d:%02d.%03d / %02d:%02d  %s  %d FPS  Notes: %d/%d  %s",
+    int len = snprintf(buf, sizeof(buf), "%02d:%02d.%03d / %02d:%02d  %s  %d FPS  Notes: %d/%d  %s",
         sec / 60, sec % 60, ms_disp, ds / 60, ds % 60,
         g.playing ? "PLAY" : "PAUSED",
         g.fps, g.md->next_idx, g.md->n,
         color_by_track ? "TRACK" : "CHAN");
-    TextOutA(bdc, 10, 4, buf, strlen(buf));
+    TextOutA(bdc, 10, 4, buf, len);
     
-    HPEN hit_pen = CreatePen(PS_SOLID, 2, RGB(60, 200, 255));
-    SelectObject(bdc, hit_pen);
+    SelectObject(bdc, g_pen_hit);
     MoveToEx(bdc, 0, hit_y, 0); LineTo(bdc, g.win_w, hit_y);
-    DeleteObject(hit_pen);
     
     BitBlt(dc, 0, 0, g.win_w, g.win_h, bdc, 0, 0, SRCCOPY);
     ReleaseDC(g.hwnd, dc);
@@ -970,11 +983,10 @@ static void s_render() {
         if (!s_gui.back_dc || !s_gui.back_bmp) { if (s_gui.back_dc) DeleteDC(s_gui.back_dc); s_gui.back_dc = 0; ReleaseDC(s_gui.hwnd, dc); return; }
         SelectObject(s_gui.back_dc, s_gui.back_bmp);
     }
-    HDC bdc = s_gui.back_dc; RECT br = {0,0,s_gui.win_w,s_gui.win_h}; FillRect(bdc, &br, GetStockObject(BLACK_BRUSH));
+    HDC bdc = s_gui.back_dc; RECT br = {0,0,s_gui.win_w,s_gui.win_h}; FillRect(bdc, &br, g_br_black);
     int hit_y = s_gui.win_h - 35;
-    HPEN gp = CreatePen(PS_SOLID,1,RGB(30,30,30)); SelectObject(bdc, gp);
+    SelectObject(bdc, g_pen_grid);
     for (int k = 0; k <= 127; k++) { if (is_black(k)) continue; int x = key_to_x(k); MoveToEx(bdc, x, 0, 0); LineTo(bdc, x, hit_y); }
-    DeleteObject(gp);
     int kw = key_width();
     int curr_tick = s_current_tick;
     int init_tempo = s_tn > 0 ? s_tempos[0].tempo : 500000;
@@ -990,8 +1002,7 @@ static void s_render() {
         if (yt < 0) yt = 0; if (yb > s_gui.win_h) yb = s_gui.win_h;
         if (yb - yt < 2 && yt + 3 < s_gui.win_h) yb = yt + 3;
         int x = key_to_x(vn->key); RECT r = {x+1, yt, x+kw-1, yb};
-        HBRUSH br = CreateSolidBrush(s_color_by_track ? track_colors[vn->track & 15] : chan_colors[vn->chan & 15]);
-        FillRect(bdc, &r, br); DeleteObject(br);
+        FillRect(bdc, &r, s_color_by_track ? track_br[vn->track & 15] : chan_br[vn->chan & 15]);
     }
     draw_keyboard(bdc);
     SetBkMode(bdc, TRANSPARENT); SetTextColor(bdc, RGB(200,200,200));
@@ -999,10 +1010,10 @@ static void s_render() {
     s_gui.fps_frames++;
     DWORD tc = GetTickCount();
     if (tc - s_gui.fps_last_tc >= 1000) { s_gui.fps = s_gui.fps_frames; s_gui.fps_frames = 0; s_gui.fps_last_tc = tc; }
-    snprintf(buf,sizeof(buf),"%02d:%02d.%03d / %02d:%02d  %s  %d FPS  Notes:%d", sec/60, sec%60, (int)s_current_ms%1000, ds/60, ds%60, s_playing?"PLAY":"PAUSED", s_gui.fps, s_vis_count);
-    TextOutA(bdc, 10, 4, buf, strlen(buf));
-    HPEN hp = CreatePen(PS_SOLID,2,RGB(60,200,255)); SelectObject(bdc, hp);
-    MoveToEx(bdc, 0, hit_y, 0); LineTo(bdc, s_gui.win_w, hit_y); DeleteObject(hp);
+    int slen = snprintf(buf,sizeof(buf),"%02d:%02d.%03d / %02d:%02d  %s  %d FPS  Notes:%d", sec/60, sec%60, (int)s_current_ms%1000, ds/60, ds%60, s_playing?"PLAY":"PAUSED", s_gui.fps, s_vis_count);
+    TextOutA(bdc, 10, 4, buf, slen);
+    SelectObject(bdc, g_pen_hit);
+    MoveToEx(bdc, 0, hit_y, 0); LineTo(bdc, s_gui.win_w, hit_y);
     BitBlt(dc, 0, 0, s_gui.win_w, s_gui.win_h, bdc, 0, 0, SRCCOPY);
     ReleaseDC(s_gui.hwnd, dc);
 }

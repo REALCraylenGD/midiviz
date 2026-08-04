@@ -5,4 +5,5 @@ Windows only, if you want other OS support and you know how to compile to other 
 controls:  
 Press C to switch between channel and track coloring  
 Press R to restart song  
+Press Space to pause  
 yeah

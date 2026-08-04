@@ -295,20 +295,24 @@ static void radix_sort_order(int *order, int *tmp, int *keys, int n) {
 
 
 
+static int g_cached_tempo_idx;
+
 static int ms_to_tick(MidiData *md, double ms) {
     double us = ms * 1000.0;
-    int lo = 0, hi = md->tn - 1;
+    int hi = md->tn - 1;
     if (us <= md->tempos[0].us) {
+        g_cached_tempo_idx = 0;
         return md->tempos[0].tick + (int)(us * md->tpq / md->tempos[0].tempo);
     }
     if (us >= md->tempos[hi].us) {
+        g_cached_tempo_idx = hi;
         return md->tempos[hi].tick + (int)((us - md->tempos[hi].us) * md->tpq / md->tempos[hi].tempo);
     }
-    while (lo < hi) {
-        int mid = (lo + hi + 1) / 2;
-        if (md->tempos[mid].us <= us) lo = mid;
-        else hi = mid - 1;
-    }
+    int lo = g_cached_tempo_idx;
+    if (lo >= md->tn || us < md->tempos[lo].us) lo = 0;
+    if (lo < hi && us >= md->tempos[lo + 1].us) lo++;
+    while (lo < hi) { int mid = (lo + hi + 1) / 2; if (md->tempos[mid].us <= us) lo = mid; else hi = mid - 1; }
+    g_cached_tempo_idx = lo;
     return md->tempos[lo].tick + (int)((us - md->tempos[lo].us) * md->tpq / md->tempos[lo].tempo);
 }
 
@@ -587,6 +591,7 @@ static MidiData *parse_midi(const uint8_t *data, int64_t size) {
 }
 
 static COLORREF chan_colors[16], track_colors[16];
+static uint32_t chan_px[16], track_px[16];
 static int color_by_track;
 static HBRUSH chan_br[16], track_br[16];
 static HBRUSH g_br_key_active, g_br_key_inactive, g_br_black;
@@ -602,6 +607,8 @@ static void init_colors() {
     for (int i = 0; i < 16; i++) {
         chan_colors[i] = RGB(cols[i][0], cols[i][1], cols[i][2]);
         track_colors[i] = RGB(cols[(i*7+3)%16][0], cols[(i*7+3)%16][1], cols[(i*7+3)%16][2]);
+        chan_px[i] = (uint32_t)((cols[i][0] << 16) | (cols[i][1] << 8) | cols[i][2]);
+        track_px[i] = (uint32_t)((cols[(i*7+3)%16][0] << 16) | (cols[(i*7+3)%16][1] << 8) | cols[(i*7+3)%16][2]);
         chan_br[i] = CreateSolidBrush(chan_colors[i]);
         track_br[i] = CreateSolidBrush(track_colors[i]);
     }
@@ -622,6 +629,7 @@ static struct {
     int win_w, win_h;
     HDC back_dc;
     HBITMAP back_bmp;
+    void *back_bits;
     int active_cnt[128];
     int render_idx, off_idx;
     LARGE_INTEGER wall_qpc;
@@ -639,12 +647,24 @@ static void all_off() {
 #define MAX_KEY 127
 #define KEY_COUNT (MAX_KEY - MIN_KEY + 1)
 
+static int g_key_x_tbl[128];
+static int g_key_w_cached;
+static int g_key_w_cached_for;
+
+static void recompute_key_table(int win_w) {
+    if (win_w == g_key_w_cached_for) return;
+    g_key_w_cached_for = win_w;
+    g_key_w_cached = (win_w - 10) / KEY_COUNT;
+    for (int k = MIN_KEY; k <= MAX_KEY; k++)
+        g_key_x_tbl[k] = k * (win_w - 10) / KEY_COUNT + 5;
+}
+
 static int key_to_x(int key) {
-    return (key - MIN_KEY) * (g.win_w - 10) / KEY_COUNT + 5;
+    return g_key_x_tbl[key];
 }
 
 static int key_width() {
-    return (g.win_w - 10) / KEY_COUNT;
+    return g_key_w_cached;
 }
 
 static int is_black(int key) {
@@ -679,11 +699,20 @@ static void render() {
     RECT cr; GetClientRect(g.hwnd, &cr);
     g.win_w = cr.right; g.win_h = cr.bottom;
     if (g.win_w < 1 || g.win_h < 1) { ReleaseDC(g.hwnd, dc); return; }
+    recompute_key_table(g.win_w);
     
     if (!g.back_dc) {
+        BITMAPINFO bmi = {0};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = g.win_w;
+        bmi.bmiHeader.biHeight = -g.win_h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        g.back_bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &g.back_bits, NULL, 0);
         g.back_dc = CreateCompatibleDC(dc);
-        g.back_bmp = CreateCompatibleBitmap(dc, g.win_w, g.win_h);
-        if (!g.back_dc || !g.back_bmp) {
+        if (!g.back_bmp || !g.back_dc) {
+            if (g.back_bmp) { DeleteObject(g.back_bmp); g.back_bmp = 0; }
             if (g.back_dc) { DeleteDC(g.back_dc); g.back_dc = 0; }
             ReleaseDC(g.hwnd, dc); return;
         }
@@ -691,42 +720,51 @@ static void render() {
     }
     
     HDC bdc = g.back_dc;
-    RECT br = {0, 0, g.win_w, g.win_h};
-    FillRect(bdc, &br, g_br_black);
+    uint32_t *px = (uint32_t *)g.back_bits;
+    int stride = g.win_w;
+    int wh = g.win_h;
     
-    int hit_y = g.win_h - 35;
+    memset(px, 0, stride * wh * sizeof(uint32_t));
+    
+    int hit_y = wh - 35;
     
     SelectObject(bdc, g_pen_grid);
     for (int k = MIN_KEY; k <= MAX_KEY; k++) {
-        int x = key_to_x(k);
         if (is_black(k)) continue;
+        int x = g_key_x_tbl[k];
         MoveToEx(bdc, x, 0, 0); LineTo(bdc, x, hit_y);
     }
     
     int max_future = (int)(g.current_ms + 1200);
     int min_past = (int)(g.current_ms - 500);
     int curr_tick = g.current_tick;
-    int kw = key_width();
+    int kw = g_key_w_cached;
     int init_tempo = g.md->tempos[0].tempo;
     int lookahead_ticks = (int)(1200.0 * 1000.0 * g.md->tpq / init_tempo);
     if (lookahead_ticks < 1) lookahead_ticks = g.md->tpq;
+    double y_scale = (double)hit_y / lookahead_ticks;
     int *order = g.md->order;
     while (g.render_idx < g.md->n && g.md->notes[order[g.render_idx]].end_ms < min_past)
         g.render_idx++;
+
+    uint32_t *palette = color_by_track ? track_px : chan_px;
     for (int i = g.render_idx; i < g.md->n; i++) {
         Note *n = &g.md->notes[order[i]];
         if (n->start_ms > max_future) break;
-        int y_start = hit_y - (int)((double)(n->start_tick - curr_tick) / lookahead_ticks * hit_y);
-        int y_end   = hit_y - (int)((double)(n->end_tick   - curr_tick) / lookahead_ticks * hit_y);
+        int y_start = hit_y - (int)((n->start_tick - curr_tick) * y_scale);
+        int y_end   = hit_y - (int)((n->end_tick   - curr_tick) * y_scale);
         int y_top = y_end, y_bot = y_start;
-        if (y_bot < 0 || y_top > g.win_h) continue;
+        if (y_bot < 0 || y_top > wh) continue;
         if (y_top < 0) y_top = 0;
-        if (y_bot > g.win_h) y_bot = g.win_h;
-        if (y_bot - y_top < 2 && y_top + 3 < g.win_h) y_bot = y_top + 3;
-        
-        int x = key_to_x(NOTE_KEY(n));
-        RECT r = {x + 1, y_top, x + kw - 1, y_bot};
-        FillRect(bdc, &r, color_by_track ? track_br[NOTE_TRACK(n) & 15] : chan_br[NOTE_CHAN(n) & 15]);
+        if (y_bot > wh) y_bot = wh;
+        if (y_bot - y_top < 2 && y_top + 3 < wh) y_bot = y_top + 3;
+        int x1 = g_key_x_tbl[NOTE_KEY(n)] + 1;
+        int x2 = g_key_x_tbl[NOTE_KEY(n)] + kw - 1;
+        uint32_t color = palette[color_by_track ? (NOTE_TRACK(n) & 15) : (NOTE_CHAN(n) & 15)];
+        for (int y = y_top; y < y_bot; y++) {
+            uint32_t *row = px + y * stride;
+            for (int x = x1; x < x2; x++) row[x] = color;
+        }
     }
     
     draw_keyboard(bdc);
@@ -798,7 +836,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(hwnd, &ps); render(); EndPaint(hwnd, &ps); return 0; }
     case WM_SIZE:
-        if (g.back_bmp) { DeleteObject(g.back_bmp); g.back_bmp = 0; DeleteDC(g.back_dc); g.back_dc = 0; }
+        if (g.back_bmp) { DeleteObject(g.back_bmp); g.back_bmp = 0; DeleteDC(g.back_dc); g.back_dc = 0; g.back_bits = 0; g_key_w_cached_for = 0; }
         return 0;
     case WM_KEYDOWN:
         if (w == VK_SPACE) {
@@ -815,7 +853,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         }
         if (w == 'R') {
             all_off(); memset(g.active_cnt, 0, sizeof(g.active_cnt));
-            g.current_ms = 0; g.current_tick = 0; g.md->next_idx = 0; g.render_idx = 0; g.off_idx = 0;
+            g.current_ms = 0; g.current_tick = 0; g.md->next_idx = 0; g.render_idx = 0; g.off_idx = 0; g_cached_tempo_idx = 0;
             for (int i = 0; i < g.md->n; i++) g.md->notes[g.md->order[i]].misc &= ~(1u << 31);
             QueryPerformanceCounter(&g.wall_qpc); g.pause_total_ms = 0;
             g.playing = 1;
@@ -969,7 +1007,7 @@ static void s_advance_to_ms(double target_ms) {
     }
 }
 
-static struct { HWND hwnd; int win_w, win_h; HDC back_dc; HBITMAP back_bmp; int active_cnt[128]; int fps, fps_frames; DWORD fps_last_tc; } s_gui;
+static struct { HWND hwnd; int win_w, win_h; HDC back_dc; HBITMAP back_bmp; void *back_bits; int active_cnt[128]; int fps, fps_frames; DWORD fps_last_tc; } s_gui;
 static int s_color_by_track;
 
 static void s_render() {
@@ -978,31 +1016,55 @@ static void s_render() {
     RECT cr; GetClientRect(s_gui.hwnd, &cr);
     s_gui.win_w = cr.right; s_gui.win_h = cr.bottom;
     if (s_gui.win_w < 1 || s_gui.win_h < 1) { ReleaseDC(s_gui.hwnd, dc); return; }
+    recompute_key_table(s_gui.win_w);
     if (!s_gui.back_dc) {
-        s_gui.back_dc = CreateCompatibleDC(dc); s_gui.back_bmp = CreateCompatibleBitmap(dc, s_gui.win_w, s_gui.win_h);
-        if (!s_gui.back_dc || !s_gui.back_bmp) { if (s_gui.back_dc) DeleteDC(s_gui.back_dc); s_gui.back_dc = 0; ReleaseDC(s_gui.hwnd, dc); return; }
+        BITMAPINFO bmi = {0};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = s_gui.win_w;
+        bmi.bmiHeader.biHeight = -s_gui.win_h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        s_gui.back_bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &s_gui.back_bits, NULL, 0);
+        s_gui.back_dc = CreateCompatibleDC(dc);
+        if (!s_gui.back_bmp || !s_gui.back_dc) {
+            if (s_gui.back_bmp) { DeleteObject(s_gui.back_bmp); s_gui.back_bmp = 0; }
+            if (s_gui.back_dc) { DeleteDC(s_gui.back_dc); s_gui.back_dc = 0; }
+            ReleaseDC(s_gui.hwnd, dc); return;
+        }
         SelectObject(s_gui.back_dc, s_gui.back_bmp);
     }
-    HDC bdc = s_gui.back_dc; RECT br = {0,0,s_gui.win_w,s_gui.win_h}; FillRect(bdc, &br, g_br_black);
-    int hit_y = s_gui.win_h - 35;
+    HDC bdc = s_gui.back_dc;
+    uint32_t *px = (uint32_t *)s_gui.back_bits;
+    int stride = s_gui.win_w;
+    int wh = s_gui.win_h;
+    memset(px, 0, stride * wh * sizeof(uint32_t));
+    int hit_y = wh - 35;
     SelectObject(bdc, g_pen_grid);
-    for (int k = 0; k <= 127; k++) { if (is_black(k)) continue; int x = key_to_x(k); MoveToEx(bdc, x, 0, 0); LineTo(bdc, x, hit_y); }
-    int kw = key_width();
+    for (int k = 0; k <= 127; k++) { if (is_black(k)) continue; int x = g_key_x_tbl[k]; MoveToEx(bdc, x, 0, 0); LineTo(bdc, x, hit_y); }
+    int kw = g_key_w_cached;
     int curr_tick = s_current_tick;
     int init_tempo = s_tn > 0 ? s_tempos[0].tempo : 500000;
     int lookahead_ticks = (int)(1200.0 * 1000.0 * s_tpq / init_tempo);
     if (lookahead_ticks < 1) lookahead_ticks = s_tpq;
+    double y_scale = (double)hit_y / lookahead_ticks;
+    uint32_t *palette = s_color_by_track ? track_px : chan_px;
     for (int i = 0; i < s_vis_count; i++) {
         SVisNote *vn = &s_vis[i];
         if (vn->end_tick <= curr_tick - lookahead_ticks/2) continue;
         if (vn->start_tick > curr_tick + lookahead_ticks) continue;
-        int ys = hit_y - (int)((double)(vn->start_tick - curr_tick) / lookahead_ticks * hit_y);
-        int ye = hit_y - (int)((double)(vn->end_tick - curr_tick) / lookahead_ticks * hit_y);
-        int yt = ye, yb = ys; if (yb < 0 || yt > s_gui.win_h) continue;
-        if (yt < 0) yt = 0; if (yb > s_gui.win_h) yb = s_gui.win_h;
-        if (yb - yt < 2 && yt + 3 < s_gui.win_h) yb = yt + 3;
-        int x = key_to_x(vn->key); RECT r = {x+1, yt, x+kw-1, yb};
-        FillRect(bdc, &r, s_color_by_track ? track_br[vn->track & 15] : chan_br[vn->chan & 15]);
+        int ys = hit_y - (int)((vn->start_tick - curr_tick) * y_scale);
+        int ye = hit_y - (int)((vn->end_tick   - curr_tick) * y_scale);
+        int yt = ye, yb = ys; if (yb < 0 || yt > wh) continue;
+        if (yt < 0) yt = 0; if (yb > wh) yb = wh;
+        if (yb - yt < 2 && yt + 3 < wh) yb = yt + 3;
+        int x1 = g_key_x_tbl[vn->key] + 1;
+        int x2 = g_key_x_tbl[vn->key] + kw - 1;
+        uint32_t color = palette[s_color_by_track ? (vn->track & 15) : (vn->chan & 15)];
+        for (int y = yt; y < yb; y++) {
+            uint32_t *row = px + y * stride;
+            for (int x = x1; x < x2; x++) row[x] = color;
+        }
     }
     draw_keyboard(bdc);
     SetBkMode(bdc, TRANSPARENT); SetTextColor(bdc, RGB(200,200,200));
@@ -1032,7 +1094,7 @@ static LRESULT CALLBACK s_WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         s_render(); return 0;
     case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(hwnd, &ps); s_render(); EndPaint(hwnd, &ps); return 0; }
     case WM_SIZE:
-        if (s_gui.back_bmp) { DeleteObject(s_gui.back_bmp); s_gui.back_bmp = 0; DeleteDC(s_gui.back_dc); s_gui.back_dc = 0; }
+        if (s_gui.back_bmp) { DeleteObject(s_gui.back_bmp); s_gui.back_bmp = 0; DeleteDC(s_gui.back_dc); s_gui.back_dc = 0; s_gui.back_bits = 0; g_key_w_cached_for = 0; }
         return 0;
     case WM_KEYDOWN:
         if (w == VK_SPACE) {

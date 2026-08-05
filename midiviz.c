@@ -340,16 +340,29 @@ typedef struct {
 } TrackChunk;
 
 static volatile LONG g_threads_done;
+static volatile int g_parse_oom;
 
 typedef struct {
     TrackChunk *chunks;
     int num_chunks;
     Note *notes;
     int n, cap;
+    int oom;
     Tempo *tempos;
     int tn, tcap;
     int tpq;
 } ParseCtx;
+
+static inline Note *ctx_next_note(ParseCtx *ctx) {
+    if (ctx->n >= ctx->cap) {
+        int nc = ctx->cap ? ctx->cap * 2 : 16384;
+        Note *nt = realloc(ctx->notes, (size_t)nc * sizeof(Note));
+        if (!nt) { ctx->oom = 1; return 0; }
+        ctx->notes = nt;
+        ctx->cap = nc;
+    }
+    return &ctx->notes[ctx->n];
+}
 
 // Parse: extract tempos + emit notes with tick values (no ms), shared array
 static DWORD WINAPI parse_thread_proc(LPVOID param) {
@@ -401,7 +414,8 @@ static DWORD WINAPI parse_thread_proc(LPVOID param) {
                     if (hi == 0x9 && p2 > 0) {
                         if (*slot >= 0) {
                             int ai = *slot;
-                            Note *n = &ctx->notes[ctx->n];
+                            Note *n = ctx_next_note(ctx);
+                            if (!n) goto oom;
                             n->misc = NOTE_PACK(p1, pending[ai].vel, chan, track_num);
                             n->start_tick = pending[ai].start_tick; n->end_tick = tick; ctx->n++;
                             np--;
@@ -413,7 +427,8 @@ static DWORD WINAPI parse_thread_proc(LPVOID param) {
                     } else if (hi == 0x8 || (hi == 0x9 && p2 == 0)) {
                         int ai = *slot;
                         if (ai >= 0) {
-                            Note *n = &ctx->notes[ctx->n];
+                            Note *n = ctx_next_note(ctx);
+                            if (!n) goto oom;
                             n->misc = NOTE_PACK(pending[ai].note, pending[ai].vel, pending[ai].chan, track_num);
                             n->start_tick = pending[ai].start_tick; n->end_tick = tick; ctx->n++;
                             *slot = -1; np--;
@@ -424,12 +439,18 @@ static DWORD WINAPI parse_thread_proc(LPVOID param) {
             }
         }
         for (int i = 0; i < np; i++) {
-            Note *n = &ctx->notes[ctx->n];
+            Note *n = ctx_next_note(ctx);
+            if (!n) goto oom;
             n->misc = NOTE_PACK(pending[i].note, pending[i].vel, pending[i].chan, track_num);
             n->start_tick = pending[i].start_tick; n->end_tick = tick; ctx->n++;
         }
     }
     free(pending);
+    InterlockedIncrement(&g_threads_done);
+    return 0;
+oom:
+    free(pending);
+    ctx->oom = 1;
     InterlockedIncrement(&g_threads_done);
     return 0;
 }
@@ -493,30 +514,16 @@ static MidiData *parse_midi(const uint8_t *data, int64_t size) {
     }
     free(counts);
 
-    // ---- Estimate total capacity (chunk_size/8 empirical ~= note count) ----
-    int64_t total_est = 0;
-    int offsets[128], caps[128];
-    for (int i = 0; i < num_threads; i++) {
-        int te = 0;
-        for (int j = 0; j < ctxs[i].num_chunks; j++)
-            te += ctxs[i].chunks[j].len / 8;
-        if (te < 65536) te = 65536;
-        te += te / 10; // 10% headroom
-        caps[i] = te;
-        offsets[i] = (int)total_est;
-        total_est += te;
-    }
-    md->notes = malloc(total_est * sizeof(Note));
-
-    // ---- Setup: per-thread tempo arrays + shared note slice ----
+    // ---- Setup: per-thread growable note buffers + tempo arrays ----
     for (int i = 0; i < num_threads; i++) {
         ctxs[i].tcap = 1024;
         ctxs[i].tempos = malloc(ctxs[i].tcap * sizeof(Tempo));
         ctxs[i].tn = 0;
         ctxs[i].tpq = md->tpq;
-        ctxs[i].notes = md->notes + offsets[i];
-        ctxs[i].cap = caps[i];
+        ctxs[i].notes = 0;
+        ctxs[i].cap = 0;
         ctxs[i].n = 0;
+        ctxs[i].oom = 0;
     }
 
     LARGE_INTEGER tp0;
@@ -552,16 +559,33 @@ static MidiData *parse_midi(const uint8_t *data, int64_t size) {
     LARGE_INTEGER tp2;
     QueryPerformanceCounter(&tp2);
 
-    // ---- Pack thread slices into contiguous md->notes ----
-    int total_notes = 0;
+    // ---- Merge thread note buffers into contiguous md->notes ----
+    int64_t total_notes = 0;
     for (int i = 0; i < num_threads; i++) total_notes += ctxs[i].n;
-    md->n = total_notes;
+    int oom = 0;
+    for (int i = 0; i < num_threads; i++) if (ctxs[i].oom) oom = 1;
+    if (oom || total_notes > INT_MAX) {
+        fprintf(stderr, "FAIL merge: oom=%d total_notes=%lld\n", oom, (long long)total_notes); fflush(stderr);        g_parse_oom = 1;
+        for (int i = 0; i < num_threads; i++) free(ctxs[i].notes);
+        for (int i = 0; i < num_threads; i++) free(ctxs[i].chunks);
+        free(ctxs); free(md->tempos); free(md);
+        return 0;
+    }
+    md->notes = malloc((size_t)total_notes * sizeof(Note));
+    if (!md->notes && total_notes > 0) {
+        fprintf(stderr, "FAIL notes malloc size=%lld\n", (long long)((size_t)total_notes * sizeof(Note))); fflush(stderr);
+        g_parse_oom = 1;
+        for (int i = 0; i < num_threads; i++) free(ctxs[i].notes);
+        for (int i = 0; i < num_threads; i++) free(ctxs[i].chunks);
+        free(ctxs); free(md->tempos); free(md);
+        return 0;
+    }
+    md->n = (int)total_notes;
     int dst = 0;
     for (int i = 0; i < num_threads; i++) {
-        int src = offsets[i], n = ctxs[i].n;
-        if (src != dst)
-            memmove(md->notes + dst, md->notes + src, n * sizeof(Note));
-        dst += n;
+        memcpy(md->notes + dst, ctxs[i].notes, (size_t)ctxs[i].n * sizeof(Note));
+        free(ctxs[i].notes);
+        dst += ctxs[i].n;
     }
 
     // ---- Compute ms via binary search tempo lookup ----
@@ -583,11 +607,21 @@ static MidiData *parse_midi(const uint8_t *data, int64_t size) {
     QueryPerformanceCounter(&ts);
 
     // ---- Sort by start_ms (index sort, keep order array) ----
-    md->order = malloc(md->n * sizeof(int));
+    md->order = malloc((size_t)md->n * sizeof(int));
+    if (!md->order && md->n > 0) {
+        g_parse_oom = 1;
+        free(md->notes); free(md->tempos); free(md);
+        return 0;
+    }
     for (int i = 0; i < md->n; i++) md->order[i] = i;
-    int *keys = malloc(md->n * sizeof(int));
+    int *keys = malloc((size_t)md->n * sizeof(int));
+    int *tmp = malloc((size_t)md->n * sizeof(int));
+    if ((!keys || !tmp) && md->n > 0) {
+        g_parse_oom = 1;
+        free(tmp); free(keys); free(md->order); free(md->notes); free(md->tempos); free(md);
+        return 0;
+    }
     for (int i = 0; i < md->n; i++) keys[i] = md->notes[i].start_ms;
-    int *tmp = malloc(md->n * sizeof(int));
     radix_sort_order(md->order, tmp, keys, md->n);
     free(tmp); free(keys);
     LARGE_INTEGER te;
@@ -1008,10 +1042,17 @@ static void s_advance_to_ms(double target_ms) {
         STrackState *tr = &s_tracks[t]; if (tr->done) continue; SNoteEvent ne;
         while (tr->tick < target_tick && tr->data < tr->end) {
             int r = s_parse_one_event(tr, 0, &ne);
-            if (r == 1 && s_vis_count < s_vis_cap) {
-                SVisNote *v = &s_vis[s_vis_count++]; v->start_ms = s_tick_to_ms(ne.tick);
-                v->end_ms = v->start_ms + 200; v->start_tick = ne.tick; v->end_tick = ne.tick + 96;
-                v->key = ne.key; v->vel = ne.vel; v->chan = ne.chan; v->track = t;
+            if (r == 1) {
+                if (s_vis_count >= s_vis_cap) {
+                    int ncap = s_vis_cap ? s_vis_cap * 2 : 4096;
+                    SVisNote *nv = realloc(s_vis, ncap * sizeof(SVisNote));
+                    if (nv) { s_vis = nv; s_vis_cap = ncap; }
+                }
+                if (s_vis_count < s_vis_cap) {
+                    SVisNote *v = &s_vis[s_vis_count++]; v->start_ms = s_tick_to_ms(ne.tick);
+                    v->end_ms = v->start_ms + 200; v->start_tick = ne.tick; v->end_tick = ne.tick + 96;
+                    v->key = ne.key; v->vel = ne.vel; v->chan = ne.chan; v->track = t;
+                }
             } else if (r == -1) {
                 for (int i = s_vis_count - 1; i >= 0; i--) {
                     SVisNote *v = &s_vis[i]; if (v->key == ne.key && v->chan == ne.chan && v->end_tick == v->start_tick + 96) { v->end_ms = s_tick_to_ms(ne.tick); v->end_tick = ne.tick; break; }
@@ -1020,6 +1061,24 @@ static void s_advance_to_ms(double target_ms) {
         }
     }
     for (int t = 0; t < s_actual; t++) { free(s_tracks[t].pending); s_tracks[t] = saved[t]; } free(saved);
+    // Evict notes that have fallen behind the visible window and can no longer be
+    // updated (their note-off already arrived, or their track is fully parsed).
+    // Open notes (end_tick still == start_tick+96) are kept so late note-ons can be paired.
+    {
+        int lo_ticks = (int)(1200.0 * 1000.0 * s_tpq / (s_tn > 0 ? s_tempos[0].tempo : 500000));
+        if (lo_ticks < 1) lo_ticks = s_tpq;
+        int drop_before = s_current_tick - lo_ticks;
+        int dst = 0;
+        for (int i = 0; i < s_vis_count; i++) {
+            SVisNote *v = &s_vis[i];
+            int open = (v->end_tick == v->start_tick + 96);
+            int track_done = (v->track < s_actual) && s_tracks[v->track].data >= s_tracks[v->track].end;
+            if (v->end_tick <= drop_before && (!open || track_done)) continue;
+            if (dst != i) s_vis[dst] = s_vis[i];
+            dst++;
+        }
+        s_vis_count = dst;
+    }
     for (int t = 0; t < s_actual; t++) {
         STrackState *tr = &s_tracks[t]; if (tr->done) continue; SNoteEvent ne;
         while (tr->tick < s_current_tick && tr->data < tr->end) {
@@ -1211,9 +1270,7 @@ static void stream_mode(const uint8_t *buf, int64_t size, int argc, char **argv)
         s_tracks[t].np_cap = 1024; s_tracks[t].pending = malloc(s_tracks[t].np_cap * sizeof(SPending));
         memset(s_tracks[t].active, -1, sizeof(s_tracks[t].active));
     }
-    int64_t total_est = 0; for (int t = 0; t < s_actual; t++) total_est += s_trk_lens[t] / 8;
-    if (total_est < 65536) total_est = 65536; total_est += total_est / 10;
-    s_vis_cap = (int)(total_est > 2000000 ? 2000000 : total_est); s_vis = malloc(s_vis_cap * sizeof(SVisNote));
+    s_vis_cap = 4096; s_vis = malloc(s_vis_cap * sizeof(SVisNote)); if (!s_vis) { MessageBoxA(0,"Out of memory initializing stream window","Error",MB_ICONERROR); return; }
     init_colors(); synth_init();
     timeBeginPeriod(1);
     HINSTANCE hInst = GetModuleHandleA(0);
@@ -1247,18 +1304,28 @@ int main(int argc, char **argv) {
     
     if (stream) { QueryPerformanceFrequency(&g_qpc_freq); stream_mode(buf, li.QuadPart, argc, argv); UnmapViewOfFile(buf); CloseHandle(hMap); CloseHandle(hFile); return 0; }
     
+    int parse_only = 0;
+    for (int i = 2; i < argc; i++) if (strcmp(argv[i], "--parse-only") == 0) parse_only = 1;
+    
     LARGE_INTEGER t0, t1, t2, freq;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
     g.md = parse_midi(buf, li.QuadPart);
     QueryPerformanceCounter(&t1);
     UnmapViewOfFile(buf); CloseHandle(hMap); CloseHandle(hFile);
-    if (!g.md) { MessageBoxA(0, "No MIDI data found", "Error", MB_ICONERROR); return 1; }
+    if (!g.md) {
+        if (parse_only) { fprintf(stderr, "PARSE FAILED\n"); fflush(stderr); return 1; }
+        MessageBoxA(0, g_parse_oom
+            ? "Out of memory: MIDI file has too many notes for main mode.\n\nUse --stream for huge files."
+            : "No MIDI data found", "Error", MB_ICONERROR);
+        return 1;
+    }
     QueryPerformanceCounter(&t2);
     fprintf(stderr, "parse total: %.2fs  notes=%d tempos=%d\n",
         (double)(t1.QuadPart - t0.QuadPart) / freq.QuadPart,
         g.md->n, g.md->tn);
     fflush(stderr);
+    if (parse_only) return 0;
     
     init_colors();
     synth_init();

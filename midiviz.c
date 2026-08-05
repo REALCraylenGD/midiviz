@@ -6,6 +6,7 @@ static void __attribute__((noinline)) pad3(int x) { g_pad = x; }
 
 #include <windows.h>
 #include <mmsystem.h>
+#include <dwmapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,11 +35,14 @@ static void __attribute__((noinline)) pad3(int x) { g_pad = x; }
 #define RING_SZ 4096
 typedef struct { short type, key, vel; } MidiEvent;
 static volatile LONG g_rw, g_rr;
+static CRITICAL_SECTION g_ring_cs;
 static MidiEvent g_ring[RING_SZ];
 static void ring_push(short type, short key, short vel) {
+    EnterCriticalSection(&g_ring_cs);
     LONG w = g_rw, nw = (w + 1) & (RING_SZ - 1);
-    if (nw == g_rr) return;
+    if (nw == g_rr) { LeaveCriticalSection(&g_ring_cs); return; }
     g_ring[w].type = type; g_ring[w].key = key; g_ring[w].vel = vel; g_rw = nw;
+    LeaveCriticalSection(&g_ring_cs);
 }
 static int ring_pop(MidiEvent *ev) {
     LONG r = g_rr;
@@ -66,6 +70,18 @@ static struct {
 static LARGE_INTEGER g_qpc_freq;
 static unsigned g_pitch_table[128];
 static int g_free_stack[SYNTH_NV], g_free_top;
+
+static UINT get_refresh_rate(void) {
+    DEVMODEA dm;
+    memset(&dm, 0, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency >= 30)
+        return dm.dmDisplayFrequency;
+    HDC dc = GetDC(NULL);
+    int v = dc ? GetDeviceCaps(dc, VREFRESH) : 0;
+    if (dc) ReleaseDC(NULL, dc);
+    return v >= 30 ? (UINT)v : 60;
+}
 
 // Called from audio thread only
 static void voice_on(int key, int vel) {
@@ -177,6 +193,7 @@ static void synth_all_off() {
 }
 
 static void synth_init() {
+    InitializeCriticalSection(&g_ring_cs);
     try_kdmapi("OmniMIDI.dll", 0);
     if (!g_use_kdmapi) try_kdmapi("KeppyDriver.dll", 1);
     if (g_use_kdmapi) return;
@@ -592,7 +609,7 @@ static MidiData *parse_midi(const uint8_t *data, int64_t size) {
 
 static COLORREF chan_colors[16], track_colors[16];
 static uint32_t chan_px[16], track_px[16];
-static int color_by_track;
+static volatile int color_by_track;
 static HBRUSH chan_br[16], track_br[16];
 static HBRUSH g_br_key_active, g_br_key_inactive, g_br_black;
 static HPEN g_pen_grid, g_pen_hit;
@@ -624,9 +641,9 @@ static struct {
     MidiData *md;
     double current_ms;
     int current_tick;
-    int playing;
+    volatile int playing;
     HWND hwnd;
-    int win_w, win_h;
+    int win_w, win_h, buf_w, buf_h;
     HDC back_dc;
     HBITMAP back_bmp;
     void *back_bits;
@@ -659,36 +676,44 @@ static void recompute_key_table(int win_w) {
         g_key_x_tbl[k] = k * (win_w - 10) / KEY_COUNT + 5;
 }
 
-static int key_to_x(int key) {
-    return g_key_x_tbl[key];
-}
-
-static int key_width() {
-    return g_key_w_cached;
-}
-
 static int is_black(int key) {
     static const int b[] = {1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1};
     return b[key % 12];
 }
 
-static void draw_keyboard(HDC dc) {
-    int kw = key_width();
-    int ky = g.win_h - 30;
+static void draw_keyboard(uint32_t *px, int stride, int win_w, int win_h, const int *active_cnt) {
+    if (win_w != g_key_w_cached_for) recompute_key_table(win_w);
+    int kw = g_key_w_cached;
+    int ky = win_h - 30;
     int kh = 28;
     for (int k = MIN_KEY; k <= MAX_KEY; k++) {
         if (is_black(k)) continue;
-        int x = key_to_x(k);
-        RECT r = {x, ky, x + kw, ky + kh};
-        FillRect(dc, &r, g.active_cnt[k] ? g_br_key_active : g_br_key_inactive);
-        FrameRect(dc, &r, g_br_black);
+        int x = g_key_x_tbl[k];
+        uint32_t color = active_cnt[k] ? 0x00FFFFFF : 0x00F0F0F0;
+        for (int y = ky; y < ky + kh; y++) {
+            uint32_t *row = px + y * stride;
+            for (int xx = x; xx < x + kw; xx++) row[xx] = color;
+        }
+        if (kw >= 3) {
+            uint32_t *r0 = px + ky * stride, *r1 = px + (ky + kh) * stride;
+            for (int xx = x; xx < x + kw; xx++) { r0[xx] = 0; r1[xx] = 0; }
+            for (int y = ky; y < ky + kh; y++) { uint32_t *row = px + y * stride; row[x] = 0; row[x + kw - 1] = 0; }
+        }
     }
     for (int k = MIN_KEY; k <= MAX_KEY; k++) {
         if (!is_black(k)) continue;
-        int x = key_to_x(k);
-        RECT r = {x - kw / 4 + 1, ky, x + kw / 4 + 1, ky + kh / 2};
-        FillRect(dc, &r, g.active_cnt[k] ? g_br_key_active : g_br_black);
-        FrameRect(dc, &r, g_br_black);
+        int x = g_key_x_tbl[k];
+        int x1 = x - kw / 4 + 1, x2 = x + kw / 4 + 1;
+        uint32_t color = active_cnt[k] ? 0x00FFFFFF : 0x00000000;
+        for (int y = ky; y < ky + kh / 2; y++) {
+            uint32_t *row = px + y * stride;
+            for (int xx = x1; xx < x2; xx++) row[xx] = color;
+        }
+        uint32_t *r0 = px + ky * stride, *r1 = px + (ky + kh / 2) * stride;
+        for (int xx = x1; xx < x2; xx++) { r0[xx] = 0; r1[xx] = 0; }
+        if (kw / 2 >= 2) {
+            for (int y = ky; y < ky + kh / 2; y++) { uint32_t *row = px + y * stride; row[x1] = 0; row[x2 - 1] = 0; }
+        }
     }
 }
 
@@ -701,7 +726,9 @@ static void render() {
     if (g.win_w < 1 || g.win_h < 1) { ReleaseDC(g.hwnd, dc); return; }
     recompute_key_table(g.win_w);
     
-    if (!g.back_dc) {
+    if (!g.back_dc || g.buf_w != g.win_w || g.buf_h != g.win_h) {
+        if (g.back_bmp) { DeleteObject(g.back_bmp); g.back_bmp = 0; }
+        if (g.back_dc) { DeleteDC(g.back_dc); g.back_dc = 0; }
         BITMAPINFO bmi = {0};
         bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bmi.bmiHeader.biWidth = g.win_w;
@@ -717,6 +744,7 @@ static void render() {
             ReleaseDC(g.hwnd, dc); return;
         }
         SelectObject(g.back_dc, g.back_bmp);
+        g.buf_w = g.win_w; g.buf_h = g.win_h;
     }
     
     HDC bdc = g.back_dc;
@@ -728,11 +756,11 @@ static void render() {
     
     int hit_y = wh - 35;
     
-    SelectObject(bdc, g_pen_grid);
     for (int k = MIN_KEY; k <= MAX_KEY; k++) {
         if (is_black(k)) continue;
         int x = g_key_x_tbl[k];
-        MoveToEx(bdc, x, 0, 0); LineTo(bdc, x, hit_y);
+        uint32_t *col = px + x;
+        for (int y = 0; y < hit_y; y++) col[y * stride] = 0x001E1E1E;
     }
     
     int max_future = (int)(g.current_ms + 1200);
@@ -767,7 +795,7 @@ static void render() {
         }
     }
     
-    draw_keyboard(bdc);
+    draw_keyboard(px, stride, g.win_w, wh, g.active_cnt);
     
     SelectObject(bdc, g_font);
     SetBkMode(bdc, TRANSPARENT);
@@ -790,54 +818,51 @@ static void render() {
         color_by_track ? "TRACK" : "CHAN");
     TextOutA(bdc, 10, 4, buf, len);
     
-    SelectObject(bdc, g_pen_hit);
-    MoveToEx(bdc, 0, hit_y, 0); LineTo(bdc, g.win_w, hit_y);
+    for (int x = 0; x < g.win_w; x++) { px[hit_y * stride + x] = 0x003CC8FF; px[(hit_y - 1) * stride + x] = 0x003CC8FF; }
     
     BitBlt(dc, 0, 0, g.win_w, g.win_h, bdc, 0, 0, SRCCOPY);
     ReleaseDC(g.hwnd, dc);
+}
+
+static volatile LONG g_rt_run;
+static HANDLE g_rt_thread;
+
+static void advance_main_frame(void) {
+    if (!g.playing || !g.md) return;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    g.current_ms = ((double)(now.QuadPart - g.wall_qpc.QuadPart) * 1000.0 / g_qpc_freq.QuadPart) - g.pause_total_ms;
+    g.current_tick = ms_to_tick(g.md, g.current_ms);
+    int *next = &g.md->next_idx;
+    int *order = g.md->order;
+    Note *notes = g.md->notes;
+    while (*next < g.md->n && notes[order[*next]].start_ms <= g.current_ms) {
+        Note *n = &notes[order[*next]];
+        synth_note_on(NOTE_KEY(n), NOTE_VEL(n), NOTE_CHAN(n));
+        g.active_cnt[NOTE_KEY(n)]++;
+        (*next)++;
+    }
+    int max_check = g.md->next_idx;
+    while (g.off_idx < max_check && NOTE_DONE(&notes[order[g.off_idx]])) g.off_idx++;
+    for (int i = g.off_idx; i < max_check; i++) {
+        int oi = order[i];
+        Note *n = &notes[oi];
+        if (NOTE_DONE(n)) continue;
+        if (n->end_ms > 0 && n->end_ms <= g.current_ms) {
+            NOTE_SET_DONE(n);
+            g.active_cnt[NOTE_KEY(n)]--;
+            synth_note_off(NOTE_KEY(n), NOTE_CHAN(n));
+        }
+    }
+    if (g.current_ms > g.md->dur_ms) { g.playing = 0; all_off(); memset(g.active_cnt, 0, sizeof(g.active_cnt)); }
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
     case WM_CREATE:
         g.hwnd = hwnd;
-        SetTimer(hwnd, 1, 3, 0);
         return 0;
-    case WM_TIMER:
-        if (g.playing && g.md) {
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            g.current_ms = ((double)(now.QuadPart - g.wall_qpc.QuadPart) * 1000.0 / g_qpc_freq.QuadPart) - g.pause_total_ms;
-            g.current_tick = ms_to_tick(g.md, g.current_ms);
-            int *next = &g.md->next_idx;
-            int *order = g.md->order;
-            Note *notes = g.md->notes;
-            while (*next < g.md->n && notes[order[*next]].start_ms <= g.current_ms) {
-                Note *n = &notes[order[*next]];
-                synth_note_on(NOTE_KEY(n), NOTE_VEL(n), NOTE_CHAN(n));
-                g.active_cnt[NOTE_KEY(n)]++;
-                (*next)++;
-            }
-            int max_check = g.md->next_idx;
-            while (g.off_idx < max_check && NOTE_DONE(&notes[order[g.off_idx]])) g.off_idx++;
-            for (int i = g.off_idx; i < max_check; i++) {
-                int oi = order[i];
-                Note *n = &notes[oi];
-                if (NOTE_DONE(n)) continue;
-                if (n->end_ms > 0 && n->end_ms <= g.current_ms) {
-                    NOTE_SET_DONE(n);
-                    g.active_cnt[NOTE_KEY(n)]--;
-                    synth_note_off(NOTE_KEY(n), NOTE_CHAN(n));
-                }
-            }
-            if (g.current_ms > g.md->dur_ms) { g.playing = 0; all_off(); memset(g.active_cnt, 0, sizeof(g.active_cnt)); }
-        }
-        render();
-        return 0;
-    case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(hwnd, &ps); render(); EndPaint(hwnd, &ps); return 0; }
-    case WM_SIZE:
-        if (g.back_bmp) { DeleteObject(g.back_bmp); g.back_bmp = 0; DeleteDC(g.back_dc); g.back_dc = 0; g.back_bits = 0; g_key_w_cached_for = 0; }
-        return 0;
+    case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(hwnd, &ps); EndPaint(hwnd, &ps); return 0; }
     case WM_KEYDOWN:
         if (w == VK_SPACE) {
             if (g.playing) {
@@ -862,6 +887,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     case WM_DESTROY:
         g.playing = 0; all_off();
+        g_rt_run = 0;
+        if (g_rt_thread) { WaitForSingleObject(g_rt_thread, 2000); CloseHandle(g_rt_thread); g_rt_thread = 0; }
         synth_close();
         KillTimer(hwnd, 1);
         if (g.back_bmp) DeleteObject(g.back_bmp);
@@ -899,7 +926,7 @@ static int s_vis_count, s_vis_cap;
 static double s_current_ms, s_pause_total_ms;
 static int s_current_tick, s_dur_ms;
 static LARGE_INTEGER s_wall_qpc, s_pause_qpc;
-static int s_playing;
+static volatile int s_playing;
 
 static int s_parse_one_event(STrackState *t, Tempo *out_tempo, SNoteEvent *ne) {
     uint8_t _c; int delta;
@@ -1007,8 +1034,8 @@ static void s_advance_to_ms(double target_ms) {
     }
 }
 
-static struct { HWND hwnd; int win_w, win_h; HDC back_dc; HBITMAP back_bmp; void *back_bits; int active_cnt[128]; int fps, fps_frames; DWORD fps_last_tc; } s_gui;
-static int s_color_by_track;
+static struct { HWND hwnd; int win_w, win_h, buf_w, buf_h; HDC back_dc; HBITMAP back_bmp; void *back_bits; int active_cnt[128]; int fps, fps_frames; DWORD fps_last_tc; } s_gui;
+static volatile int s_color_by_track;
 
 static void s_render() {
     if (!s_gui.hwnd) return;
@@ -1017,7 +1044,9 @@ static void s_render() {
     s_gui.win_w = cr.right; s_gui.win_h = cr.bottom;
     if (s_gui.win_w < 1 || s_gui.win_h < 1) { ReleaseDC(s_gui.hwnd, dc); return; }
     recompute_key_table(s_gui.win_w);
-    if (!s_gui.back_dc) {
+    if (!s_gui.back_dc || s_gui.buf_w != s_gui.win_w || s_gui.buf_h != s_gui.win_h) {
+        if (s_gui.back_bmp) { DeleteObject(s_gui.back_bmp); s_gui.back_bmp = 0; }
+        if (s_gui.back_dc) { DeleteDC(s_gui.back_dc); s_gui.back_dc = 0; }
         BITMAPINFO bmi = {0};
         bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bmi.bmiHeader.biWidth = s_gui.win_w;
@@ -1033,6 +1062,7 @@ static void s_render() {
             ReleaseDC(s_gui.hwnd, dc); return;
         }
         SelectObject(s_gui.back_dc, s_gui.back_bmp);
+        s_gui.buf_w = s_gui.win_w; s_gui.buf_h = s_gui.win_h;
     }
     HDC bdc = s_gui.back_dc;
     uint32_t *px = (uint32_t *)s_gui.back_bits;
@@ -1040,8 +1070,7 @@ static void s_render() {
     int wh = s_gui.win_h;
     memset(px, 0, stride * wh * sizeof(uint32_t));
     int hit_y = wh - 35;
-    SelectObject(bdc, g_pen_grid);
-    for (int k = 0; k <= 127; k++) { if (is_black(k)) continue; int x = g_key_x_tbl[k]; MoveToEx(bdc, x, 0, 0); LineTo(bdc, x, hit_y); }
+    for (int k = 0; k <= 127; k++) { if (is_black(k)) continue; int x = g_key_x_tbl[k]; uint32_t *col = px + x; for (int y = 0; y < hit_y; y++) col[y * stride] = 0x001E1E1E; }
     int kw = g_key_w_cached;
     int curr_tick = s_current_tick;
     int init_tempo = s_tn > 0 ? s_tempos[0].tempo : 500000;
@@ -1066,7 +1095,7 @@ static void s_render() {
             for (int x = x1; x < x2; x++) row[x] = color;
         }
     }
-    draw_keyboard(bdc);
+    draw_keyboard(px, stride, s_gui.win_w, wh, s_gui.active_cnt);
     SetBkMode(bdc, TRANSPARENT); SetTextColor(bdc, RGB(200,200,200));
     char buf[256]; int sec = (int)(s_current_ms/1000); int ds = s_dur_ms/1000;
     s_gui.fps_frames++;
@@ -1074,28 +1103,48 @@ static void s_render() {
     if (tc - s_gui.fps_last_tc >= 1000) { s_gui.fps = s_gui.fps_frames; s_gui.fps_frames = 0; s_gui.fps_last_tc = tc; }
     int slen = snprintf(buf,sizeof(buf),"%02d:%02d.%03d / %02d:%02d  %s  %d FPS  Notes:%d", sec/60, sec%60, (int)s_current_ms%1000, ds/60, ds%60, s_playing?"PLAY":"PAUSED", s_gui.fps, s_vis_count);
     TextOutA(bdc, 10, 4, buf, slen);
-    SelectObject(bdc, g_pen_hit);
-    MoveToEx(bdc, 0, hit_y, 0); LineTo(bdc, s_gui.win_w, hit_y);
+    for (int x = 0; x < s_gui.win_w; x++) { px[hit_y * stride + x] = 0x003CC8FF; px[(hit_y - 1) * stride + x] = 0x003CC8FF; }
     BitBlt(dc, 0, 0, s_gui.win_w, s_gui.win_h, bdc, 0, 0, SRCCOPY);
     ReleaseDC(s_gui.hwnd, dc);
 }
 
+static void advance_stream_frame(void) {
+    if (!s_playing) return;
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    s_current_ms = ((double)(now.QuadPart - s_wall_qpc.QuadPart) * 1000.0 / g_qpc_freq.QuadPart) - s_pause_total_ms;
+    if (s_current_ms > s_dur_ms) { s_playing = 0; synth_all_off(); memset(s_gui.active_cnt, 0, sizeof(s_gui.active_cnt)); }
+    s_current_tick = s_ms_to_tick(s_current_ms);
+    s_advance_to_ms(s_current_ms + 1200);
+}
+
+static DWORD WINAPI render_loop(LPVOID arg) {
+    int stream = arg ? 1 : 0;
+    LONGLONG frame_ticks = g_qpc_freq.QuadPart / (LONGLONG)get_refresh_rate();
+    if (frame_ticks < 1) frame_ticks = 1;
+    LARGE_INTEGER next;
+    QueryPerformanceCounter(&next);
+    while (g_rt_run) {
+        if (stream) { advance_stream_frame(); s_render(); }
+        else { advance_main_frame(); render(); }
+        next.QuadPart += frame_ticks;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart < next.QuadPart) {
+            DWORD wait_ms = (DWORD)((next.QuadPart - now.QuadPart) * 1000 / g_qpc_freq.QuadPart);
+            if (wait_ms > 1) Sleep(wait_ms - 1);
+            while (now.QuadPart < next.QuadPart) { QueryPerformanceCounter(&now); }
+        } else {
+            QueryPerformanceCounter(&now);
+            next.QuadPart = now.QuadPart + frame_ticks;
+        }
+    }
+    return 0;
+}
+
 static LRESULT CALLBACK s_WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
-    case WM_CREATE: s_gui.hwnd = hwnd; SetTimer(hwnd, 1, 3, 0); return 0;
-    case WM_TIMER:
-        if (s_playing) {
-            LARGE_INTEGER now; QueryPerformanceCounter(&now);
-            s_current_ms = ((double)(now.QuadPart - s_wall_qpc.QuadPart) * 1000.0 / g_qpc_freq.QuadPart) - s_pause_total_ms;
-            if (s_current_ms > s_dur_ms) { s_playing = 0; synth_all_off(); memset(s_gui.active_cnt, 0, sizeof(s_gui.active_cnt)); }
-            s_current_tick = s_ms_to_tick(s_current_ms);
-            s_advance_to_ms(s_current_ms + 1200);
-        }
-        s_render(); return 0;
-    case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(hwnd, &ps); s_render(); EndPaint(hwnd, &ps); return 0; }
-    case WM_SIZE:
-        if (s_gui.back_bmp) { DeleteObject(s_gui.back_bmp); s_gui.back_bmp = 0; DeleteDC(s_gui.back_dc); s_gui.back_dc = 0; s_gui.back_bits = 0; g_key_w_cached_for = 0; }
-        return 0;
+    case WM_CREATE: s_gui.hwnd = hwnd; return 0;
+    case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(hwnd, &ps); EndPaint(hwnd, &ps); return 0; }
     case WM_KEYDOWN:
         if (w == VK_SPACE) {
             if (s_playing) { QueryPerformanceCounter(&s_pause_qpc); s_playing = 0; synth_all_off(); memset(s_gui.active_cnt,0,sizeof(s_gui.active_cnt)); }
@@ -1110,7 +1159,9 @@ static LRESULT CALLBACK s_WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         if (w == 'C') s_color_by_track ^= 1;
         return 0;
     case WM_DESTROY:
-        s_playing = 0; synth_all_off(); synth_close(); KillTimer(hwnd, 1);
+        s_playing = 0; synth_all_off(); synth_close();
+        g_rt_run = 0;
+        if (g_rt_thread) { WaitForSingleObject(g_rt_thread, 2000); CloseHandle(g_rt_thread); g_rt_thread = 0; }
         if (s_gui.back_bmp) DeleteObject(s_gui.back_bmp);
         if (s_gui.back_dc) DeleteDC(s_gui.back_dc);
         PostQuitMessage(0); return 0;
@@ -1164,6 +1215,7 @@ static void stream_mode(const uint8_t *buf, int64_t size, int argc, char **argv)
     if (total_est < 65536) total_est = 65536; total_est += total_est / 10;
     s_vis_cap = (int)(total_est > 2000000 ? 2000000 : total_est); s_vis = malloc(s_vis_cap * sizeof(SVisNote));
     init_colors(); synth_init();
+    timeBeginPeriod(1);
     HINSTANCE hInst = GetModuleHandleA(0);
     WNDCLASSEXA wc = {sizeof(WNDCLASSEXA),0,s_WndProc,0,0,hInst,0,0,0,0,"MidiVizStream",0};
     RegisterClassExA(&wc);
@@ -1173,6 +1225,8 @@ static void stream_mode(const uint8_t *buf, int64_t size, int argc, char **argv)
     ShowWindow(hwnd, SW_SHOW);
     fprintf(stderr, "load: %.2fs  tracks=%d tempos=%d dur=%ds\n", (double)(t1.QuadPart - t0.QuadPart) / g_qpc_freq.QuadPart, s_actual, s_tn, s_dur_ms/1000); fflush(stderr);
     QueryPerformanceCounter(&s_wall_qpc); s_playing = 1;
+    g_rt_run = 1;
+    g_rt_thread = CreateThread(0, 0, render_loop, (void*)1, 0, 0);
     MSG msg; while (GetMessageA(&msg, 0, 0, 0)) { TranslateMessage(&msg); DispatchMessageA(&msg); }
 }
 
@@ -1220,6 +1274,8 @@ int main(int argc, char **argv) {
     PostMessageA(hwnd, WM_NULL, 0, 0);
     QueryPerformanceCounter(&g.wall_qpc);
     g.playing = 1;
+    g_rt_run = 1;
+    g_rt_thread = CreateThread(0, 0, render_loop, 0, 0, 0);
     
     MSG msg;
     while (GetMessageA(&msg, 0, 0, 0)) {
